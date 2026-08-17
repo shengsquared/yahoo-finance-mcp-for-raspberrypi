@@ -83,6 +83,7 @@ OAUTH_EXEMPT_PATHS = frozenset(
     {
         "/authorize",
         "/token",
+        "/register",
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
     }
@@ -306,6 +307,27 @@ def build_oauth_routes(
             }
         )
 
+    async def register(request: Request) -> Response:
+        # Deliberately not real dynamic client registration (RFC 7591): this endpoint is
+        # reachable without a token, same as /authorize and /token, so actually minting
+        # new credentials here would hand a working client out to anyone who asks --
+        # exactly what requiring a client ID/secret is meant to prevent. The metadata
+        # above already omits registration_endpoint, which is how a spec-compliant
+        # client is supposed to know DCR isn't offered and go straight to using
+        # pre-configured credentials. This route exists only in case a client tries
+        # anyway: a typed OAuth error, rather than a bare 404, so it has something
+        # more specific to react to than "this server doesn't exist."
+        return JSONResponse(
+            {
+                "error": "invalid_client_metadata",
+                "error_description": (
+                    "Dynamic client registration is not supported. Use the "
+                    "pre-configured client ID and secret directly."
+                ),
+            },
+            status_code=400,
+        )
+
     return [
         Route(
             "/.well-known/oauth-authorization-server",
@@ -317,6 +339,7 @@ def build_oauth_routes(
         ),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
+        Route("/register", register, methods=["POST"]),
     ]
 
 
