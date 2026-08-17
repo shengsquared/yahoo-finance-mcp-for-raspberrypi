@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # Every base image used here is published for linux/arm64, so this builds natively
 # on 64-bit Raspberry Pi OS. To build it on another machine for a Pi, use:
 #   docker buildx build --platform linux/arm64 -t yahoo-finance-mcp .
@@ -15,9 +13,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md server.py ./
 
 # Build the virtual environment from the lock file so the image does not resolve
-# dependencies (or compile them from source) on the Pi itself.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev
+# dependencies (or compile them from source) on the Pi itself. Deliberately not using
+# a BuildKit cache mount here: it buys nothing on a CI builder that starts fresh each
+# time (Google Cloud Build's default docker builder, GitHub Actions runners without
+# buildx set up) and those builders fail outright on BuildKit-only RUN syntax.
+RUN uv sync --locked --no-dev
 
 # Second stage: runtime image
 FROM python:3.11-slim-bookworm
