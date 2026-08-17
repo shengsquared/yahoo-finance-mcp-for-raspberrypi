@@ -23,6 +23,16 @@ Environment=YFINANCE_MCP_HOST=0.0.0.0
 Environment=YFINANCE_MCP_PORT=8000
 Environment=YFINANCE_MCP_LOG_LEVEL=INFO
 
+# Optional client credentials for the sse/streamable-http transports (e.g. for a
+# claude.ai custom connector). Leave the file missing/empty to keep the endpoint
+# unauthenticated. Create it with, then edit:
+#   sudo install -m 600 /dev/null /etc/yahoo-finance-mcp.env
+# and put in it:
+#   YFINANCE_MCP_CLIENT_ID=...
+#   YFINANCE_MCP_CLIENT_SECRET=...
+# The leading "-" makes a missing file a no-op instead of a startup failure.
+EnvironmentFile=-/etc/yahoo-finance-mcp.env
+
 # Keep the server from crowding out everything else on a small board.
 Nice=5
 MemoryMax=512M

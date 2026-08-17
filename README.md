@@ -146,8 +146,10 @@ yahoo-finance-mcp --transport streamable-http --host 0.0.0.0 --port 8000
 The endpoint is then `http://<host>:8000/mcp`. Each flag has an environment variable
 equivalent — `YFINANCE_MCP_TRANSPORT`, `YFINANCE_MCP_HOST`, `YFINANCE_MCP_PORT`,
 `YFINANCE_MCP_LOG_LEVEL`, `YFINANCE_CACHE_DIR` — and `--transport sse` is available for
-clients that still use the older SSE transport. There is no authentication, so do not put
-the HTTP transports on an untrusted network.
+clients that still use the older SSE transport. By default there is no authentication; add
+`--client-id`/`--client-secret` (or `YFINANCE_MCP_CLIENT_ID`/`YFINANCE_MCP_CLIENT_SECRET`)
+to require them as HTTP Basic Auth credentials on every request. Do not put an
+unauthenticated server on an untrusted network.
 
 ### Raspberry Pi
 

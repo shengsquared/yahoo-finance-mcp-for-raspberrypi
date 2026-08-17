@@ -1,4 +1,6 @@
 import argparse
+import base64
+import hmac
 import json
 import logging
 import os
@@ -6,13 +8,51 @@ import sys
 from enum import Enum
 from pathlib import Path
 
+import anyio
 import pandas as pd
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
+from starlette.datastructures import Headers
+from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger("yahoo_finance_mcp")
 
 TRANSPORTS = ("stdio", "sse", "streamable-http")
+
+
+class BasicAuthMiddleware:
+    """Gate every request behind a fixed client ID / secret pair (HTTP Basic Auth).
+
+    Not full OAuth: claude.ai's custom connector setup also accepts a fixed
+    Authorization header for servers that don't implement OAuth (see the
+    "Request headers" advanced setting), and Basic Auth is the standard scheme built
+    from a client ID + secret pair, so this is what satisfies that without a full
+    OAuth authorization server.
+    """
+
+    def __init__(self, app: ASGIApp, client_id: str, client_secret: str) -> None:
+        self._app = app
+        credentials = f"{client_id}:{client_secret}".encode()
+        self._expected = base64.b64encode(credentials).decode()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        authorization = Headers(scope=scope).get("authorization", "")
+        scheme, _, credentials = authorization.partition(" ")
+        if scheme.lower() == "basic" and hmac.compare_digest(credentials, self._expected):
+            await self._app(scope, receive, send)
+            return
+
+        response = Response(
+            "Unauthorized",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="yahoo-finance-mcp"'},
+        )
+        await response(scope, receive, send)
 
 
 def _default_cache_dir() -> Path:
@@ -492,7 +532,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("YFINANCE_MCP_LOG_LEVEL", "INFO"),
         help="Logging level, e.g. DEBUG, INFO, WARNING (env: YFINANCE_MCP_LOG_LEVEL). Default: INFO",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--client-id",
+        default=os.getenv("YFINANCE_MCP_CLIENT_ID"),
+        help=(
+            "Require this client ID, paired with --client-secret, as HTTP Basic Auth "
+            "credentials on the sse/streamable-http transports (env: "
+            "YFINANCE_MCP_CLIENT_ID). Omit both to leave the endpoint unauthenticated. "
+            "Prefer the env vars over the flags: process arguments are visible to other "
+            "users on the same machine (e.g. via `ps`)."
+        ),
+    )
+    parser.add_argument(
+        "--client-secret",
+        default=os.getenv("YFINANCE_MCP_CLIENT_SECRET"),
+        help="Secret paired with --client-id (env: YFINANCE_MCP_CLIENT_SECRET).",
+    )
+    args = parser.parse_args(argv)
+
+    if bool(args.client_id) != bool(args.client_secret):
+        parser.error("--client-id and --client-secret must be set together, or not at all")
+
+    return args
+
+
+async def _serve_http(
+    transport: str,
+    host: str,
+    port: int,
+    log_level: str,
+    client_id: str | None,
+    client_secret: str | None,
+) -> None:
+    """Serve the sse/streamable-http transport, bypassing FastMCP.run() so a
+    BasicAuthMiddleware can be attached to the app before it starts."""
+    import uvicorn
+
+    app = yfinance_server.sse_app() if transport == "sse" else yfinance_server.streamable_http_app()
+    if client_id:
+        app.add_middleware(BasicAuthMiddleware, client_id=client_id, client_secret=client_secret)
+    config = uvicorn.Config(app, host=host, port=port, log_level=log_level.lower())
+    await uvicorn.Server(config).serve()
 
 
 def main() -> None:
@@ -508,26 +588,47 @@ def main() -> None:
 
     configure_cache(args.cache_dir)
 
-    yfinance_server.settings.host = args.host
-    yfinance_server.settings.port = args.port
-
     if args.transport == "stdio":
+        if args.client_id:
+            logger.warning(
+                "--client-id/--client-secret only apply to the sse and streamable-http "
+                "transports; ignoring them for stdio."
+            )
         logger.info("Starting Yahoo Finance MCP server on stdio...")
-    else:
-        path = (
-            yfinance_server.settings.sse_path
-            if args.transport == "sse"
-            else yfinance_server.settings.streamable_http_path
-        )
-        logger.info(
-            "Starting Yahoo Finance MCP server at http://%s:%s%s (%s)...",
+        yfinance_server.run(transport="stdio")
+        return
+
+    path = (
+        yfinance_server.settings.sse_path
+        if args.transport == "sse"
+        else yfinance_server.settings.streamable_http_path
+    )
+    auth_state = "required (client credentials)" if args.client_id else "NONE (unauthenticated)"
+    logger.info(
+        "Starting Yahoo Finance MCP server at http://%s:%s%s (%s), authentication: %s...",
+        args.host,
+        args.port,
+        path,
+        args.transport,
+        auth_state,
+    )
+    if not args.client_id:
+        logger.warning(
+            "No --client-id/--client-secret set: anything that can reach %s:%s can call "
+            "every tool. See docs/raspberry-pi.md before exposing this beyond localhost.",
             args.host,
             args.port,
-            path,
-            args.transport,
         )
 
-    yfinance_server.run(transport=args.transport)
+    anyio.run(
+        _serve_http,
+        args.transport,
+        args.host,
+        args.port,
+        args.log_level,
+        args.client_id,
+        args.client_secret,
+    )
 
 
 if __name__ == "__main__":
