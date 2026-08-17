@@ -165,6 +165,37 @@ back to stdio with `mcp-remote` in `claude_desktop_config.json`:
 }
 ```
 
+**claude.ai (custom connector)** runs the request from Anthropic's servers, not your
+browser, so `raspberrypi.local`, a LAN IP, or a Tailscale/WireGuard address won't work —
+unlike every option above, this one needs a URL reachable from the public internet, over
+HTTPS. Get one without opening ports on your router or managing your own certificate:
+
+```bash
+# Cloudflare Tunnel: quick and free, prints a https://<random>.trycloudflare.com URL
+cloudflared tunnel --url http://localhost:8000
+
+# Tailscale Funnel: if the Pi is already on your tailnet
+sudo tailscale funnel 8000   # -> https://<pi-name>.<your-tailnet>.ts.net
+```
+
+(For a stable domain instead of a random one, use a
+[named Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+in place of the quick-tunnel command above.)
+
+Then in claude.ai: **Settings → Connectors → Add custom connector**, and give it
+`https://<your-tunnel-domain>/mcp` — the `/mcp` path matters; that's the
+`streamable-http` endpoint, not `/sse`.
+
+This is a bigger exposure than the LAN options above: the server has no authentication, so
+the HTTPS URL alone is enough for anyone to call every tool, not just claude.ai. The data
+is public market data, so there's nothing secret to leak, but someone could still run up
+your Pi's load or trip Yahoo's rate limit on your behalf. If that matters, put an auth gate
+in front — Cloudflare Tunnel supports
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+(email OTP / SSO) ahead of the tunnel for exactly this. Otherwise treat the URL itself as
+the secret: don't commit or post it, and tear the tunnel down (`tailscale funnel off`, or
+just stop `cloudflared`) when you're not actively using the connector.
+
 Quick check that the service is up from another machine:
 
 ```bash
@@ -212,3 +243,5 @@ limits are yours to lose.
 | `Connection refused` from another machine | Server is bound to `127.0.0.1`. Set `YFINANCE_MCP_HOST=0.0.0.0` and restart. |
 | Tools return "Too Many Requests" | Yahoo rate limiting. Wait it out; it is not a Pi-specific problem. |
 | `raspberrypi.local` doesn't resolve | mDNS is unavailable on your network — use the IP from `hostname -I`. |
+| claude.ai custom connector can't connect | The URL must be public HTTPS reachable from the internet — claude.ai's servers make the request, not your browser, so a LAN or Tailscale-only address won't work. See "claude.ai (custom connector)" above. |
+| claude.ai connects but lists no tools / errors after connecting | Check the URL ends in `/mcp` (the `streamable-http` path) and the tunnel is actually forwarding to the server's port. Test with the `curl` command above, from a machine outside your LAN. |

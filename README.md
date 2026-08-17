@@ -162,8 +162,8 @@ sudo bash scripts/install-pi.sh
 
 A Docker Compose setup is included too (`docker compose up -d --build`). See
 [docs/raspberry-pi.md](docs/raspberry-pi.md) for OS and Python requirements, why 64-bit
-matters, how to connect Claude Desktop or Claude Code from another machine, resource and
-security notes, and troubleshooting.
+matters, how to connect Claude Desktop, Claude Code, or a claude.ai custom connector from
+another machine, resource and security notes, and troubleshooting.
 
 ### Integration with Claude for Desktop
 
