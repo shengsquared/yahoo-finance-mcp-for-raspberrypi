@@ -874,7 +874,20 @@ async def _serve_http(
         app.routes.extend(
             build_oauth_routes(client_id, client_secret, oauth_redirect_hosts.split(","))
         )
-    config = uvicorn.Config(app, host=host, port=port, log_level=log_level.lower())
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        # Trust X-Forwarded-Proto from any connecting IP, not just uvicorn's default of
+        # 127.0.0.1. Behind Cloud Run (or any reverse proxy/tunnel), the proxy terminates
+        # TLS and forwards plain HTTP to this container, so without this the OAuth
+        # discovery metadata below would build every URL as http:// instead of https://
+        # -- which is exactly why claude.ai reported "no MCP server found at the provided
+        # URL" even after a successful login. Safe unconditionally: this only affects how
+        # the server describes its own URLs in responses, not any auth decision.
+        forwarded_allow_ips="*",
+    )
     await uvicorn.Server(config).serve()
 
 
