@@ -262,6 +262,56 @@ or env var and restart) if you suspect it has.
 The data it serves is public market data, but the Pi's outbound bandwidth and Yahoo's rate
 limits are yours to lose.
 
+### If you tunnel this to the internet: what it does and doesn't expose
+
+A Cloudflare Tunnel or Tailscale Funnel (section 4) is a proxy for one local port, not a
+hole in your network. `cloudflared` and `tailscale funnel` make an outbound-only connection
+out to their own edge and forward exactly `localhost:<port>` back through it — nothing on
+your router opens up, and nothing else on your LAN becomes reachable through that tunnel.
+Someone with the tunnel URL and (if configured) the client credentials can reach this one
+MCP server. They cannot use it, as a network path, to reach your other devices.
+
+The one path that *could* reach further is if the server process itself were compromised —
+a vulnerability in a dependency (`yfinance`, `pandas`, `curl_cffi`) giving an attacker code
+execution on the Pi, who then tries to pivot from there to the rest of your LAN. That's not
+specific to tunneling; it's the same risk any always-on internet-facing service on a home
+device carries. Layered mitigations, roughly strongest first:
+
+1. **Network segmentation.** Put the Pi on a guest network or VLAN with client isolation,
+   so it has no route to your other devices regardless of what happens to the process
+   itself. Router-dependent (UniFi, OPNsense/pfSense, and some consumer routers support
+   this); it's the only option here that holds even if the application-level defenses
+   below fail.
+2. **Block outbound LAN traffic at the service level.** The systemd unit has a commented-out
+   pair of lines for this:
+   ```
+   IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
+   IPAddressAllow=localhost
+   ```
+   With these on, the process can still reach Yahoo Finance and localhost, but the kernel
+   refuses any connection it tries to open to another device on your network — a compromised
+   process has nowhere to pivot *to*. The tradeoff: these rules block LAN traffic in both
+   directions, so only enable them if `YFINANCE_MCP_HOST` is `127.0.0.1` and the server is
+   reached solely through the tunnel. With `YFINANCE_MCP_HOST=0.0.0.0` (the installer's
+   default, for LAN clients like Claude Code), turning this on would also block those LAN
+   clients — segmentation (option 1) is the way to get both.
+3. **The existing process sandboxing** (`DynamicUser`, `ProtectSystem=strict`,
+   `ProtectHome`, `NoNewPrivileges`, etc., already in the unit) limits what a compromised
+   process could do *on* the Pi itself — no write access outside its state directory, no
+   privilege escalation. It doesn't limit where the process can connect *to*; that's what
+   option 2 is for.
+4. **Keep dependencies patched.** `sudo /opt/yahoo-finance-mcp/.venv/bin/pip install
+   --upgrade yahoo-finance-mcp` periodically (or rebuild the Docker image). This server's
+   own code has no `eval`, shell-out, or arbitrary file write in its request path; a real
+   vulnerability is far more likely to show up in a dependency than in the ~500 lines here.
+
+For the Docker path, the same "bind to `127.0.0.1`, let the tunnel be the only way in"
+pattern applies — publish the port as `"127.0.0.1:8000:8000"` in `docker-compose.yml`
+instead of `"8000:8000"`. Docker containers can otherwise reach the LAN through the host by
+default, and locking that down needs host-level firewall rules (the `DOCKER-USER` iptables
+chain) that are specific enough to your setup that this repo doesn't attempt to ship them —
+segmentation (option 1) is the more portable fix if that matters for a container deployment.
+
 ## 7. Troubleshooting
 
 | Symptom | Cause / fix |

@@ -15,10 +15,15 @@ services:
       # YFINANCE_MCP_CLIENT_ID: your-client-id
       # YFINANCE_MCP_CLIENT_SECRET: your-client-secret
     ports:
-      # Bound to the LAN so other machines can reach it. Without the client
-      # credentials above, the server has no authentication at all -- keep this
-      # off the public internet. See docs/raspberry-pi.md for the security notes.
+      # Published on all interfaces, so other machines on the LAN can reach it.
+      # Without the client credentials above, the server has no authentication at
+      # all -- keep this off the public internet. See docs/raspberry-pi.md for the
+      # security notes.
       - "8000:8000"
+      # If you only need this reachable through a tunnel (e.g. for a claude.ai
+      # custom connector) and not directly from the LAN, publish to localhost only
+      # instead -- comment out the line above and uncomment this one:
+      # - "127.0.0.1:8000:8000"
     volumes:
       - yfinance-cache:/home/mcp/.cache
     mem_limit: 512m
