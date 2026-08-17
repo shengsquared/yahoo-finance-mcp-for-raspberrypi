@@ -59,9 +59,15 @@ Docker image use:
 | `--port` | `YFINANCE_MCP_PORT` | `8000` |
 | `--cache-dir` | `YFINANCE_CACHE_DIR` | `~/.cache/yahoo-finance-mcp` |
 | `--log-level` | `YFINANCE_MCP_LOG_LEVEL` | `INFO` |
+| `--client-id` | `YFINANCE_MCP_CLIENT_ID` | unset (no auth) |
+| `--client-secret` | `YFINANCE_MCP_CLIENT_SECRET` | unset (no auth) |
 
 Use `--host 0.0.0.0` to accept connections from the rest of the LAN. Read the security
-note in section 6 before you do.
+note in section 6 before you do. Set `--client-id`/`--client-secret` (both, or neither) to
+require them as HTTP Basic Auth credentials on every request to the sse/streamable-http
+transports — see "claude.ai (custom connector)" below for where that matters most. Prefer
+the env vars over the flags for the secret: process arguments are visible to other users on
+the same machine (e.g. via `ps`).
 
 ## 3. Install
 
@@ -165,6 +171,54 @@ back to stdio with `mcp-remote` in `claude_desktop_config.json`:
 }
 ```
 
+**claude.ai (custom connector)** runs the request from Anthropic's servers, not your
+browser, so `raspberrypi.local`, a LAN IP, or a Tailscale/WireGuard address won't work —
+unlike every option above, this one needs a URL reachable from the public internet, over
+HTTPS. Get one without opening ports on your router or managing your own certificate:
+
+```bash
+# Cloudflare Tunnel: quick and free, prints a https://<random>.trycloudflare.com URL
+cloudflared tunnel --url http://localhost:8000
+
+# Tailscale Funnel: if the Pi is already on your tailnet
+sudo tailscale funnel 8000   # -> https://<pi-name>.<your-tailnet>.ts.net
+```
+
+(For a stable domain instead of a random one, use a
+[named Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+in place of the quick-tunnel command above.)
+
+This is a bigger exposure than the LAN options above: once the URL is public, the HTTPS
+URL alone would be enough for anyone to call every tool, not just claude.ai — unless the
+server requires credentials. It does support that: start it with `--client-id`/
+`--client-secret` (or the `YFINANCE_MCP_CLIENT_ID`/`YFINANCE_MCP_CLIENT_SECRET` env vars —
+`install-pi.sh` and `docker-compose.yml` both have knobs for this, see section 3), and it
+requires those as HTTP Basic Auth on every request. Generate the header value once:
+
+```bash
+echo -n 'your-client-id:your-client-secret' | base64
+```
+
+In claude.ai, add the connector with **Settings → Connectors → Add custom connector**,
+`https://<your-tunnel-domain>/mcp` as the URL (the `/mcp` path matters — that's the
+`streamable-http` endpoint, not `/sse`), then open **Advanced settings** and add it under
+**Request headers**, *not* the OAuth Client ID / Client Secret fields — those drive a full
+OAuth authorization-code flow this server doesn't implement, and won't work here:
+
+| Header | Value |
+|---|---|
+| `Authorization` | `Basic <output from the command above>` |
+
+Without credentials configured, the data being public market data means there's nothing
+secret to leak, but someone could still run up your Pi's load or trip Yahoo's rate limit on
+your behalf. With credentials configured, the risk is closer to "know the URL and the
+secret" than "know the URL." Either way, a tunnel provider's own auth gate is another
+option and stacks with this — Cloudflare Tunnel supports
+[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)
+(email OTP / SSO) in front of the tunnel. And regardless of which you use, tear the tunnel
+down (`tailscale funnel off`, or just stop `cloudflared`) when you're not actively using
+the connector.
+
 Quick check that the service is up from another machine:
 
 ```bash
@@ -187,18 +241,76 @@ curl -i -X POST http://raspberrypi.local:8000/mcp \
 
 ## 6. Security
 
-**This server has no authentication.** Anything that can reach the port can call every
-tool. On the HTTP transports:
+**By default this server has no authentication.** Anything that can reach the port can
+call every tool. On the HTTP transports:
 
 - Bind to `127.0.0.1` unless you actually need remote access.
 - If you need remote access, keep it on the LAN or a private overlay network such as
   Tailscale or WireGuard. `YFINANCE_MCP_HOST=0.0.0.0` plus a port-forward on your router
   puts an unauthenticated service on the public internet — don't.
-- If you must expose it beyond the LAN, put a reverse proxy (Caddy, nginx) in front with
-  TLS and authentication, and leave the server bound to localhost behind it.
+- If you must expose it beyond the LAN (the claude.ai custom connector case), set
+  `--client-id`/`--client-secret` (section 2) so the server itself requires credentials,
+  and/or put a reverse proxy or tunnel provider's auth gate in front — see "claude.ai
+  (custom connector)" in section 4.
+
+Note what `--client-id`/`--client-secret` is and isn't: it's a single shared HTTP Basic
+Auth credential checked with a constant-time comparison, which is enough to stop anyone
+who doesn't have it from calling a tool. It is not rate-limiting, not per-user accounts,
+and not a defense against the secret itself leaking — rotate it (edit the credentials file
+or env var and restart) if you suspect it has.
 
 The data it serves is public market data, but the Pi's outbound bandwidth and Yahoo's rate
 limits are yours to lose.
+
+### If you tunnel this to the internet: what it does and doesn't expose
+
+A Cloudflare Tunnel or Tailscale Funnel (section 4) is a proxy for one local port, not a
+hole in your network. `cloudflared` and `tailscale funnel` make an outbound-only connection
+out to their own edge and forward exactly `localhost:<port>` back through it — nothing on
+your router opens up, and nothing else on your LAN becomes reachable through that tunnel.
+Someone with the tunnel URL and (if configured) the client credentials can reach this one
+MCP server. They cannot use it, as a network path, to reach your other devices.
+
+The one path that *could* reach further is if the server process itself were compromised —
+a vulnerability in a dependency (`yfinance`, `pandas`, `curl_cffi`) giving an attacker code
+execution on the Pi, who then tries to pivot from there to the rest of your LAN. That's not
+specific to tunneling; it's the same risk any always-on internet-facing service on a home
+device carries. Layered mitigations, roughly strongest first:
+
+1. **Network segmentation.** Put the Pi on a guest network or VLAN with client isolation,
+   so it has no route to your other devices regardless of what happens to the process
+   itself. Router-dependent (UniFi, OPNsense/pfSense, and some consumer routers support
+   this); it's the only option here that holds even if the application-level defenses
+   below fail.
+2. **Block outbound LAN traffic at the service level.** The systemd unit has a commented-out
+   pair of lines for this:
+   ```
+   IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
+   IPAddressAllow=localhost
+   ```
+   With these on, the process can still reach Yahoo Finance and localhost, but the kernel
+   refuses any connection it tries to open to another device on your network — a compromised
+   process has nowhere to pivot *to*. The tradeoff: these rules block LAN traffic in both
+   directions, so only enable them if `YFINANCE_MCP_HOST` is `127.0.0.1` and the server is
+   reached solely through the tunnel. With `YFINANCE_MCP_HOST=0.0.0.0` (the installer's
+   default, for LAN clients like Claude Code), turning this on would also block those LAN
+   clients — segmentation (option 1) is the way to get both.
+3. **The existing process sandboxing** (`DynamicUser`, `ProtectSystem=strict`,
+   `ProtectHome`, `NoNewPrivileges`, etc., already in the unit) limits what a compromised
+   process could do *on* the Pi itself — no write access outside its state directory, no
+   privilege escalation. It doesn't limit where the process can connect *to*; that's what
+   option 2 is for.
+4. **Keep dependencies patched.** `sudo /opt/yahoo-finance-mcp/.venv/bin/pip install
+   --upgrade yahoo-finance-mcp` periodically (or rebuild the Docker image). This server's
+   own code has no `eval`, shell-out, or arbitrary file write in its request path; a real
+   vulnerability is far more likely to show up in a dependency than in the ~500 lines here.
+
+For the Docker path, the same "bind to `127.0.0.1`, let the tunnel be the only way in"
+pattern applies — publish the port as `"127.0.0.1:8000:8000"` in `docker-compose.yml`
+instead of `"8000:8000"`. Docker containers can otherwise reach the LAN through the host by
+default, and locking that down needs host-level firewall rules (the `DOCKER-USER` iptables
+chain) that are specific enough to your setup that this repo doesn't attempt to ship them —
+segmentation (option 1) is the more portable fix if that matters for a container deployment.
 
 ## 7. Troubleshooting
 
@@ -212,3 +324,7 @@ limits are yours to lose.
 | `Connection refused` from another machine | Server is bound to `127.0.0.1`. Set `YFINANCE_MCP_HOST=0.0.0.0` and restart. |
 | Tools return "Too Many Requests" | Yahoo rate limiting. Wait it out; it is not a Pi-specific problem. |
 | `raspberrypi.local` doesn't resolve | mDNS is unavailable on your network — use the IP from `hostname -I`. |
+| claude.ai custom connector can't connect | The URL must be public HTTPS reachable from the internet — claude.ai's servers make the request, not your browser, so a LAN or Tailscale-only address won't work. See "claude.ai (custom connector)" above. |
+| `curl`/client gets `401 Unauthorized` | `--client-id`/`--client-secret` is set and the request has no (or the wrong) `Authorization: Basic ...` header. Check `journalctl -u yahoo-finance-mcp` for the "authentication: required" line to confirm it's on, and regenerate the header with `echo -n 'id:secret' \| base64`. |
+| claude.ai connector added but tools fail with "unauthorized" | The header went in the wrong field. It has to be under Advanced settings → **Request headers**, not the OAuth Client ID / Client Secret fields — those are for a different (OAuth) flow this server doesn't implement. |
+| claude.ai connects but lists no tools / errors after connecting | Check the URL ends in `/mcp` (the `streamable-http` path) and the tunnel is actually forwarding to the server's port. Test with the `curl` command above, from a machine outside your LAN. |

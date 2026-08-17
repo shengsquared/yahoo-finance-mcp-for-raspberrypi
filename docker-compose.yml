@@ -8,11 +8,22 @@ services:
       YFINANCE_MCP_TRANSPORT: streamable-http
       YFINANCE_MCP_HOST: 0.0.0.0
       YFINANCE_MCP_PORT: "8000"
+      # Uncomment to require these as HTTP Basic Auth credentials (e.g. for a
+      # claude.ai custom connector). Set both, or leave both commented out to
+      # keep the endpoint unauthenticated. Prefer an env_file / secret over
+      # inlining a real secret here if this file is committed anywhere.
+      # YFINANCE_MCP_CLIENT_ID: your-client-id
+      # YFINANCE_MCP_CLIENT_SECRET: your-client-secret
     ports:
-      # Bound to the LAN so other machines can reach it. The server has no
-      # authentication, so keep this off the public internet -- see
-      # docs/raspberry-pi.md for the security notes.
+      # Published on all interfaces, so other machines on the LAN can reach it.
+      # Without the client credentials above, the server has no authentication at
+      # all -- keep this off the public internet. See docs/raspberry-pi.md for the
+      # security notes.
       - "8000:8000"
+      # If you only need this reachable through a tunnel (e.g. for a claude.ai
+      # custom connector) and not directly from the LAN, publish to localhost only
+      # instead -- comment out the line above and uncomment this one:
+      # - "127.0.0.1:8000:8000"
     volumes:
       - yfinance-cache:/home/mcp/.cache
     mem_limit: 512m

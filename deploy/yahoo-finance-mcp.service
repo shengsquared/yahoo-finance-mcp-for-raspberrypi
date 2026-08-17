@@ -23,6 +23,16 @@ Environment=YFINANCE_MCP_HOST=0.0.0.0
 Environment=YFINANCE_MCP_PORT=8000
 Environment=YFINANCE_MCP_LOG_LEVEL=INFO
 
+# Optional client credentials for the sse/streamable-http transports (e.g. for a
+# claude.ai custom connector). Leave the file missing/empty to keep the endpoint
+# unauthenticated. Create it with, then edit:
+#   sudo install -m 600 /dev/null /etc/yahoo-finance-mcp.env
+# and put in it:
+#   YFINANCE_MCP_CLIENT_ID=...
+#   YFINANCE_MCP_CLIENT_SECRET=...
+# The leading "-" makes a missing file a no-op instead of a startup failure.
+EnvironmentFile=-/etc/yahoo-finance-mcp.env
+
 # Keep the server from crowding out everything else on a small board.
 Nice=5
 MemoryMax=512M
@@ -40,6 +50,17 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+
+# Block outbound connections to LAN address ranges: even if the server process were
+# compromised (e.g. via a dependency vulnerability), it could not use that as a foothold
+# to reach other devices on your network -- only the public internet (Yahoo Finance) and
+# localhost remain reachable. This blocks LAN traffic in both directions, though, so only
+# turn it on if YFINANCE_MCP_HOST above is 127.0.0.1 and the server is reached solely
+# through a tunnel (see the claude.ai section of docs/raspberry-pi.md) -- with
+# YFINANCE_MCP_HOST=0.0.0.0, this would also block the LAN clients (Claude Code, Claude
+# Desktop) that setup is for.
+#IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
+#IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target

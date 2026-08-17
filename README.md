@@ -146,8 +146,10 @@ yahoo-finance-mcp --transport streamable-http --host 0.0.0.0 --port 8000
 The endpoint is then `http://<host>:8000/mcp`. Each flag has an environment variable
 equivalent — `YFINANCE_MCP_TRANSPORT`, `YFINANCE_MCP_HOST`, `YFINANCE_MCP_PORT`,
 `YFINANCE_MCP_LOG_LEVEL`, `YFINANCE_CACHE_DIR` — and `--transport sse` is available for
-clients that still use the older SSE transport. There is no authentication, so do not put
-the HTTP transports on an untrusted network.
+clients that still use the older SSE transport. By default there is no authentication; add
+`--client-id`/`--client-secret` (or `YFINANCE_MCP_CLIENT_ID`/`YFINANCE_MCP_CLIENT_SECRET`)
+to require them as HTTP Basic Auth credentials on every request. Do not put an
+unauthenticated server on an untrusted network.
 
 ### Raspberry Pi
 
@@ -162,8 +164,8 @@ sudo bash scripts/install-pi.sh
 
 A Docker Compose setup is included too (`docker compose up -d --build`). See
 [docs/raspberry-pi.md](docs/raspberry-pi.md) for OS and Python requirements, why 64-bit
-matters, how to connect Claude Desktop or Claude Code from another machine, resource and
-security notes, and troubleshooting.
+matters, how to connect Claude Desktop, Claude Code, or a claude.ai custom connector from
+another machine, resource and security notes, and troubleshooting.
 
 ### Integration with Claude for Desktop
 

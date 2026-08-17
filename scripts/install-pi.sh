@@ -5,21 +5,33 @@
 #   sudo bash scripts/install-pi.sh
 #
 # Environment overrides:
-#   APP_DIR   installation directory        (default /opt/yahoo-finance-mcp)
-#   MCP_HOST  interface to bind             (default 0.0.0.0)
-#   MCP_PORT  port to listen on             (default 8000)
+#   APP_DIR         installation directory        (default /opt/yahoo-finance-mcp)
+#   MCP_HOST        interface to bind             (default 0.0.0.0)
+#   MCP_PORT        port to listen on             (default 8000)
+#   MCP_CLIENT_ID     require this client ID as HTTP Basic Auth on the server,
+#   MCP_CLIENT_SECRET paired with it -- set both or neither. Leave unset to keep
+#                      the endpoint unauthenticated (the default).
 
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/yahoo-finance-mcp}"
 MCP_HOST="${MCP_HOST:-0.0.0.0}"
 MCP_PORT="${MCP_PORT:-8000}"
+MCP_CLIENT_ID="${MCP_CLIENT_ID:-}"
+MCP_CLIENT_SECRET="${MCP_CLIENT_SECRET:-}"
 SERVICE_NAME="yahoo-finance-mcp.service"
+CREDENTIALS_FILE="/etc/yahoo-finance-mcp.env"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "${EUID}" -ne 0 ]]; then
     echo "This script needs root to write to ${APP_DIR} and /etc/systemd/system." >&2
     echo "Re-run it as: sudo $0" >&2
+    exit 1
+fi
+
+if [[ ( -n "${MCP_CLIENT_ID}" && -z "${MCP_CLIENT_SECRET}" ) || \
+      ( -z "${MCP_CLIENT_ID}" && -n "${MCP_CLIENT_SECRET}" ) ]]; then
+    echo "MCP_CLIENT_ID and MCP_CLIENT_SECRET must be set together, or not at all." >&2
     exit 1
 fi
 
@@ -68,6 +80,15 @@ python3 -m venv "${APP_DIR}/.venv"
 echo "==> Installing the server (this can take a few minutes on a Pi)"
 "${APP_DIR}/.venv/bin/pip" install "${REPO_DIR}"
 
+if [[ -n "${MCP_CLIENT_ID}" ]]; then
+    echo "==> Writing client credentials to ${CREDENTIALS_FILE}"
+    install -m 600 /dev/null "${CREDENTIALS_FILE}"
+    {
+        echo "YFINANCE_MCP_CLIENT_ID=${MCP_CLIENT_ID}"
+        echo "YFINANCE_MCP_CLIENT_SECRET=${MCP_CLIENT_SECRET}"
+    } >"${CREDENTIALS_FILE}"
+fi
+
 echo "==> Installing ${SERVICE_NAME}"
 sed \
     -e "s|/opt/yahoo-finance-mcp|${APP_DIR}|g" \
@@ -80,5 +101,10 @@ systemctl enable --now "${SERVICE_NAME}"
 
 echo
 echo "==> Done. The server is listening on http://${MCP_HOST}:${MCP_PORT}/mcp"
+if [[ -n "${MCP_CLIENT_ID}" ]]; then
+    echo "    Authentication: required -- client ID '${MCP_CLIENT_ID}' (see ${CREDENTIALS_FILE})"
+else
+    echo "    Authentication: NONE -- see docs/raspberry-pi.md before exposing this beyond localhost"
+fi
 echo "    Status: systemctl status ${SERVICE_NAME}"
 echo "    Logs:   journalctl -u ${SERVICE_NAME} -f"
