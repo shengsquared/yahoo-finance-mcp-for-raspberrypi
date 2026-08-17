@@ -1,51 +1,126 @@
 import argparse
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
 import sys
+import time
 from enum import Enum
 from pathlib import Path
+from urllib.parse import urlencode, urlparse
 
 import anyio
 import pandas as pd
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
 from starlette.datastructures import Headers
-from starlette.responses import Response
+from starlette.requests import Request
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger("yahoo_finance_mcp")
 
 TRANSPORTS = ("stdio", "sse", "streamable-http")
 
+# How long an authorization code / access token issued by the OAuth endpoints below
+# stays valid. Codes are exchanged within seconds during a live login; tokens are meant
+# to last a client a while without needing a refresh-token dance.
+OAUTH_CODE_TTL_SECONDS = 60
+OAUTH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
 
-class BasicAuthMiddleware:
-    """Gate every request behind a fixed client ID / secret pair (HTTP Basic Auth).
 
-    Not full OAuth: claude.ai's custom connector setup also accepts a fixed
-    Authorization header for servers that don't implement OAuth (see the
-    "Request headers" advanced setting), and Basic Auth is the standard scheme built
-    from a client ID + secret pair, so this is what satisfies that without a full
-    OAuth authorization server.
+def _sign_token(payload: dict, secret: str) -> str:
+    """Encode payload as a compact, tamper-evident token: base64(json).base64(hmac).
+
+    Deliberately not a real JWT library -- this only needs one algorithm (HMAC-SHA256)
+    and this project has no other use for a JWT dependency. Verification is purely
+    computational (no server-side lookup), so it survives Cloud Run cold starts and
+    multiple instances without any shared state.
+    """
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).rstrip(
+        b"="
+    )
+    sig = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=")
+    return (body + b"." + sig_b64).decode()
+
+
+def _verify_token(token: str, secret: str) -> dict | None:
+    """Verify a token from _sign_token. Returns the payload, or None if invalid/expired."""
+    try:
+        body_b64, sig_b64 = token.encode().split(b".", 1)
+    except ValueError:
+        return None
+    expected_sig = base64.urlsafe_b64encode(
+        hmac.new(secret.encode(), body_b64, hashlib.sha256).digest()
+    )
+    expected_sig = expected_sig.rstrip(b"=")
+    if not hmac.compare_digest(sig_b64, expected_sig):
+        return None
+    try:
+        padded = body_b64 + b"=" * (-len(body_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+    except Exception:
+        return None
+    if payload.get("exp", 0) < time.time():
+        return None
+    return payload
+
+
+# Paths that must stay reachable without a token -- they're how you get one, or how a
+# client discovers where to ask. Their own logic (client_id/secret, PKCE, redirect_uri
+# allow-list) is the security boundary here, not this middleware.
+OAUTH_EXEMPT_PATHS = frozenset(
+    {
+        "/authorize",
+        "/token",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+    }
+)
+
+
+class ClientAuthMiddleware:
+    """Gate every request behind a fixed client ID / secret pair, accepted either as
+    HTTP Basic Auth or as a Bearer token issued by this server's own OAuth endpoints
+    (see build_oauth_routes below). claude.ai's custom connector can use whichever it
+    prefers -- a Request Headers value, or the OAuth Client ID/Secret fields.
     """
 
     def __init__(self, app: ASGIApp, client_id: str, client_secret: str) -> None:
         self._app = app
+        self._client_id = client_id
+        self._client_secret = client_secret
         credentials = f"{client_id}:{client_secret}".encode()
-        self._expected = base64.b64encode(credentials).decode()
+        self._expected_basic = base64.b64encode(credentials).decode()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
+        if scope["path"] in OAUTH_EXEMPT_PATHS:
+            await self._app(scope, receive, send)
+            return
 
         authorization = Headers(scope=scope).get("authorization", "")
         scheme, _, credentials = authorization.partition(" ")
-        if scheme.lower() == "basic" and hmac.compare_digest(credentials, self._expected):
+        if scheme.lower() == "basic" and hmac.compare_digest(credentials, self._expected_basic):
             await self._app(scope, receive, send)
             return
+        if scheme.lower() == "bearer":
+            payload = _verify_token(credentials, self._client_secret)
+            if payload is not None and payload.get("client_id") == self._client_id:
+                await self._app(scope, receive, send)
+                return
 
         response = Response(
             "Unauthorized",
@@ -53,6 +128,196 @@ class BasicAuthMiddleware:
             headers={"WWW-Authenticate": 'Basic realm="yahoo-finance-mcp"'},
         )
         await response(scope, receive, send)
+
+
+# --- Minimal OAuth 2.1 authorization server ---
+#
+# Just enough to satisfy claude.ai's custom connector "OAuth Client ID / Client
+# Secret" fields: one pre-registered client (the same --client-id/--client-secret
+# used for Basic Auth), the authorization-code + PKCE flow, no dynamic client
+# registration, no refresh tokens, no persistent storage -- codes and access tokens
+# are self-contained signed values (see _sign_token/_verify_token above), so this
+# works correctly even if Cloud Run recycles the instance or scales to more than one.
+#
+# What this deliberately does not do: enforce single-use of an authorization code
+# (there's no server-side state to mark one as spent), so a code could in principle
+# be replayed within its 60-second window. Accepted trade-off for a personal,
+# single-user server -- getting that far already requires knowing the client ID and
+# reaching a redirect_uri on an allow-listed host.
+
+_CONSENT_PAGE = """<!doctype html>
+<html><head><title>Yahoo Finance MCP</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 28rem; margin: 4rem auto; padding: 0 1rem;">
+<h1 style="font-size: 1.25rem;">Yahoo Finance MCP</h1>
+<p>A client is requesting access to this server's tools.</p>
+<form method="post">
+  {hidden_fields}
+  <button type="submit" style="padding: 0.5rem 1.5rem; font-size: 1rem;">Approve</button>
+</form>
+</body></html>"""
+
+
+def _pkce_challenge_from_verifier(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def build_oauth_routes(
+    client_id: str, client_secret: str, redirect_hosts: list[str]
+) -> list[Route]:
+    """Routes implementing the minimal OAuth flow described above."""
+
+    allowed_hosts = {h.strip() for h in redirect_hosts if h.strip()}
+
+    async def authorization_server_metadata(request: Request) -> Response:
+        base = str(request.base_url).rstrip("/")
+        return JSONResponse(
+            {
+                "issuer": base,
+                "authorization_endpoint": f"{base}/authorize",
+                "token_endpoint": f"{base}/token",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": [
+                    "client_secret_basic",
+                    "client_secret_post",
+                ],
+            }
+        )
+
+    async def protected_resource_metadata(request: Request) -> Response:
+        base = str(request.base_url).rstrip("/")
+        return JSONResponse({"resource": f"{base}/mcp", "authorization_servers": [base]})
+
+    async def authorize(request: Request) -> Response:
+        if request.method == "GET":
+            params = dict(request.query_params)
+        else:
+            params = dict(await request.form())
+
+        req_client_id = params.get("client_id", "")
+        redirect_uri = params.get("redirect_uri", "")
+        response_type = params.get("response_type", "")
+        code_challenge = params.get("code_challenge", "")
+        code_challenge_method = params.get("code_challenge_method", "")
+        state = params.get("state", "")
+
+        # Validate redirect_uri before it's ever used in a redirect -- an unvalidated
+        # redirect_uri is how an authorization code ends up handed to an attacker.
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+            logger.warning(
+                "OAuth /authorize rejected redirect_uri=%r (allowed hosts: %s). If this "
+                "looks like a legitimate client, set YFINANCE_MCP_OAUTH_REDIRECT_HOSTS to "
+                "include %r.",
+                redirect_uri,
+                sorted(allowed_hosts),
+                parsed.hostname,
+            )
+            return PlainTextResponse(
+                f"Invalid redirect_uri: host must be one of {sorted(allowed_hosts)}.",
+                status_code=400,
+            )
+
+        if (
+            req_client_id != client_id
+            or response_type != "code"
+            or code_challenge_method != "S256"
+            or not code_challenge
+        ):
+            return RedirectResponse(
+                f"{redirect_uri}?" + urlencode({"error": "invalid_request", "state": state}),
+                status_code=302,
+            )
+
+        if request.method == "GET":
+            hidden = "".join(
+                f'<input type="hidden" name="{k}" value="{v}">' for k, v in params.items()
+            )
+            return HTMLResponse(_CONSENT_PAGE.format(hidden_fields=hidden))
+
+        code = _sign_token(
+            {
+                "client_id": req_client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": code_challenge,
+                "exp": time.time() + OAUTH_CODE_TTL_SECONDS,
+            },
+            client_secret,
+        )
+        return RedirectResponse(
+            f"{redirect_uri}?" + urlencode({"code": code, "state": state}), status_code=302
+        )
+
+    async def token(request: Request) -> Response:
+        form = await request.form()
+        grant_type = form.get("grant_type", "")
+        code = form.get("code", "")
+        redirect_uri = form.get("redirect_uri", "")
+        code_verifier = form.get("code_verifier", "")
+
+        req_client_id, req_client_secret = None, None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode()
+                req_client_id, _, req_client_secret = decoded.partition(":")
+            except Exception:
+                pass
+        if not req_client_id:
+            req_client_id = form.get("client_id", "")
+            req_client_secret = form.get("client_secret", "")
+
+        if grant_type != "authorization_code":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+        if req_client_id != client_id or not hmac.compare_digest(
+            req_client_secret or "", client_secret
+        ):
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+        payload = _verify_token(code, client_secret)
+        if payload is None:
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "code invalid or expired"},
+                status_code=400,
+            )
+        if payload.get("redirect_uri") != redirect_uri:
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "redirect_uri mismatch"},
+                status_code=400,
+            )
+        expected_challenge = _pkce_challenge_from_verifier(code_verifier)
+        if not hmac.compare_digest(expected_challenge, payload.get("code_challenge", "")):
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "code_verifier mismatch"},
+                status_code=400,
+            )
+
+        access_token = _sign_token(
+            {"client_id": req_client_id, "exp": time.time() + OAUTH_TOKEN_TTL_SECONDS},
+            client_secret,
+        )
+        return JSONResponse(
+            {
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": OAUTH_TOKEN_TTL_SECONDS,
+            }
+        )
+
+    return [
+        Route(
+            "/.well-known/oauth-authorization-server",
+            authorization_server_metadata,
+            methods=["GET"],
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]
+        ),
+        Route("/authorize", authorize, methods=["GET", "POST"]),
+        Route("/token", token, methods=["POST"]),
+    ]
 
 
 def _default_cache_dir() -> Path:
@@ -548,6 +813,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("YFINANCE_MCP_CLIENT_SECRET"),
         help="Secret paired with --client-id (env: YFINANCE_MCP_CLIENT_SECRET).",
     )
+    parser.add_argument(
+        "--oauth-redirect-hosts",
+        default=os.getenv("YFINANCE_MCP_OAUTH_REDIRECT_HOSTS", "claude.ai"),
+        help=(
+            "Comma-separated hostnames the OAuth /authorize endpoint will redirect "
+            "back to (env: YFINANCE_MCP_OAUTH_REDIRECT_HOSTS). Only matters if "
+            "--client-id/--client-secret are set. Default: claude.ai -- if the OAuth "
+            "flow rejects claude.ai's redirect_uri, the server logs the exact host it "
+            "saw; add that here."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if bool(args.client_id) != bool(args.client_secret):
@@ -563,14 +839,18 @@ async def _serve_http(
     log_level: str,
     client_id: str | None,
     client_secret: str | None,
+    oauth_redirect_hosts: str,
 ) -> None:
-    """Serve the sse/streamable-http transport, bypassing FastMCP.run() so a
-    BasicAuthMiddleware can be attached to the app before it starts."""
+    """Serve the sse/streamable-http transport, bypassing FastMCP.run() so
+    ClientAuthMiddleware and the OAuth routes can be attached before it starts."""
     import uvicorn
 
     app = yfinance_server.sse_app() if transport == "sse" else yfinance_server.streamable_http_app()
     if client_id:
-        app.add_middleware(BasicAuthMiddleware, client_id=client_id, client_secret=client_secret)
+        app.add_middleware(ClientAuthMiddleware, client_id=client_id, client_secret=client_secret)
+        app.routes.extend(
+            build_oauth_routes(client_id, client_secret, oauth_redirect_hosts.split(","))
+        )
     config = uvicorn.Config(app, host=host, port=port, log_level=log_level.lower())
     await uvicorn.Server(config).serve()
 
@@ -628,6 +908,7 @@ def main() -> None:
         args.log_level,
         args.client_id,
         args.client_secret,
+        args.oauth_redirect_hosts,
     )
 
 
