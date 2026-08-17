@@ -61,13 +61,15 @@ Docker image use:
 | `--log-level` | `YFINANCE_MCP_LOG_LEVEL` | `INFO` |
 | `--client-id` | `YFINANCE_MCP_CLIENT_ID` | unset (no auth) |
 | `--client-secret` | `YFINANCE_MCP_CLIENT_SECRET` | unset (no auth) |
+| `--oauth-redirect-hosts` | `YFINANCE_MCP_OAUTH_REDIRECT_HOSTS` | `claude.ai` |
 
 Use `--host 0.0.0.0` to accept connections from the rest of the LAN. Read the security
 note in section 6 before you do. Set `--client-id`/`--client-secret` (both, or neither) to
-require them as HTTP Basic Auth credentials on every request to the sse/streamable-http
-transports — see "claude.ai (custom connector)" below for where that matters most. Prefer
-the env vars over the flags for the secret: process arguments are visible to other users on
-the same machine (e.g. via `ps`).
+require them on every request to the sse/streamable-http transports -- as HTTP Basic Auth,
+or via a minimal built-in OAuth flow, whichever the connecting client wants (see "claude.ai
+(custom connector)" below for where that matters most). Prefer the env vars over the flags
+for the secret: process arguments are visible to other users on the same machine (e.g. via
+`ps`).
 
 ## 3. Install
 
@@ -199,22 +201,49 @@ This is a bigger exposure than the LAN options above: once the URL is public, th
 URL alone would be enough for anyone to call every tool, not just claude.ai — unless the
 server requires credentials. It does support that: start it with `--client-id`/
 `--client-secret` (or the `YFINANCE_MCP_CLIENT_ID`/`YFINANCE_MCP_CLIENT_SECRET` env vars —
-`install-pi.sh` and `docker-compose.yml` both have knobs for this, see section 3), and it
-requires those as HTTP Basic Auth on every request. Generate the header value once:
-
-```bash
-echo -n 'your-client-id:your-client-secret' | base64
-```
+`install-pi.sh` and `docker-compose.yml` both have knobs for this, see section 3).
 
 In claude.ai, add the connector with **Settings → Connectors → Add custom connector**,
 `https://<your-tunnel-domain>/mcp` as the URL (the `/mcp` path matters — that's the
-`streamable-http` endpoint, not `/sse`), then open **Advanced settings** and add it under
-**Request headers**, *not* the OAuth Client ID / Client Secret fields — those drive a full
-OAuth authorization-code flow this server doesn't implement, and won't work here:
+`streamable-http` endpoint, not `/sse`), then open **Advanced settings**. Which fields you
+see there varies by account, so use whichever is available:
 
-| Header | Value |
-|---|---|
-| `Authorization` | `Basic <output from the command above>` |
+- **OAuth Client ID / Client Secret fields** (the common case): enter the same
+  `--client-id`/`--client-secret` values here. The server implements a minimal OAuth 2.1
+  authorization-code + PKCE flow specifically so these fields work — see "How the OAuth
+  flow works" below if you're curious what that means concretely. claude.ai will redirect
+  through a one-click "Approve" page on the server itself the first time it connects.
+- **Request headers** (a beta feature, gated to some account types): if you have this
+  instead, Basic Auth also works and is simpler --
+  `echo -n 'your-client-id:your-client-secret' | base64`, then set header
+  `Authorization` to `Basic <that output>`.
+
+Both mechanisms are always on together whenever `--client-id`/`--client-secret` are set --
+pick whichever your account actually shows you.
+
+### How the OAuth flow works (and what it deliberately doesn't do)
+
+One thing worth knowing before you rely on it: `--client-id`/`--client-secret` are reused
+as the OAuth client's credentials, so there's only one thing to generate and configure
+either way. The flow itself is a standard authorization-code exchange with PKCE, but kept
+intentionally minimal for a personal, single-user server:
+
+- No dynamic client registration -- there's exactly one pre-registered client, the one you
+  configured.
+- No database. Authorization codes and access tokens are self-contained, HMAC-signed
+  values (verified by recomputing the signature, not by a lookup), so the server stays
+  correct even if Cloud Run recycles the instance between requests -- there's no
+  server-side state to lose.
+- No refresh tokens. Access tokens last 30 days; after that, claude.ai re-runs the login.
+- The `/authorize` redirect target is checked against an allow-list
+  (`--oauth-redirect-hosts` / `YFINANCE_MCP_OAUTH_REDIRECT_HOSTS`, comma-separated,
+  defaulting to `claude.ai`) before it's ever used, so an authorization code can't be
+  redirected somewhere else. If claude.ai's actual redirect host doesn't match the
+  default, the server logs the exact host it saw and rejects the request rather than
+  guessing -- check the logs and add that host to the env var.
+- Authorization codes aren't marked single-use (there's no server-side store to mark them
+  in). They expire in 60 seconds, which bounds the exposure; a stricter implementation
+  would enforce this too, but it's a deliberate simplification for a server with one user.
 
 Without credentials configured, the data being public market data means there's nothing
 secret to leak, but someone could still run up your Pi's load or trip Yahoo's rate limit on
@@ -333,5 +362,7 @@ segmentation (option 1) is the more portable fix if that matters for a container
 | `raspberrypi.local` doesn't resolve | mDNS is unavailable on your network — use the IP from `hostname -I`. |
 | claude.ai custom connector can't connect | The URL must be public HTTPS reachable from the internet — claude.ai's servers make the request, not your browser, so a LAN or Tailscale-only address won't work. See "claude.ai (custom connector)" above. |
 | `curl`/client gets `401 Unauthorized` | `--client-id`/`--client-secret` is set and the request has no (or the wrong) `Authorization: Basic ...` header. Check `journalctl -u yahoo-finance-mcp` for the "authentication: required" line to confirm it's on, and regenerate the header with `echo -n 'id:secret' \| base64`. |
-| claude.ai connector added but tools fail with "unauthorized" | The header went in the wrong field. It has to be under Advanced settings → **Request headers**, not the OAuth Client ID / Client Secret fields — those are for a different (OAuth) flow this server doesn't implement. |
+| claude.ai connector added but tools fail with "unauthorized" | If using Request headers, double check the header value against a fresh `echo -n 'id:secret' \| base64`. If using the OAuth fields, confirm the Client ID/Secret you entered match `--client-id`/`--client-secret` exactly. |
+| claude.ai says "couldn't register with sign-in service" / OAuth registration fails | claude.ai attempted OAuth without `--client-id`/`--client-secret` set on the server, so there's no sign-in service for it to find (`/authorize`/`/token` don't exist until those are configured). Set them, or leave both the OAuth and Request Header fields empty in claude.ai and it should connect unauthenticated instead -- if it still tries OAuth against an unauthenticated server, that's claude.ai's own connector behavior, not something fixable here. |
+| OAuth flow fails at the redirect step with "Invalid redirect_uri" | The host claude.ai used doesn't match `--oauth-redirect-hosts` (default `claude.ai`). Check `journalctl -u yahoo-finance-mcp` for the "OAuth /authorize rejected redirect_uri=..." line -- it names the exact host it saw -- and add that to `YFINANCE_MCP_OAUTH_REDIRECT_HOSTS`. |
 | claude.ai connects but lists no tools / errors after connecting | Check the URL ends in `/mcp` (the `streamable-http` path) and the tunnel is actually forwarding to the server's port. Test with the `curl` command above, from a machine outside your LAN. |
