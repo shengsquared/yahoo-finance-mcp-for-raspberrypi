@@ -114,6 +114,13 @@ To change settings later, edit `/etc/systemd/system/yahoo-finance-mcp.service` (
 The unit runs under `DynamicUser=yes` with a read-only filesystem and a `MemoryMax=512M`
 cap, and keeps its yfinance timezone cache in `/var/lib/yahoo-finance-mcp`.
 
+To remove everything this script installed (the systemd unit, the venv, the credentials
+file, and the state directory) -- and the Docker install below, if you used that instead:
+
+```bash
+sudo bash scripts/uninstall-pi.sh
+```
+
 ### Option C — Docker
 
 The `Dockerfile` builds from `python:3.11-slim-bookworm`, which is published for arm64, so
