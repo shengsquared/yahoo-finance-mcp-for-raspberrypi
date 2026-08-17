@@ -1,41 +1,48 @@
-# Use a Python image with uv pre-installed
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS uv
+# syntax=docker/dockerfile:1
 
-# Install the project into /app
+# Every base image used here is published for linux/arm64, so this builds natively
+# on 64-bit Raspberry Pi OS. To build it on another machine for a Pi, use:
+#   docker buildx build --platform linux/arm64 -t yahoo-finance-mcp .
+
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS builder
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
 WORKDIR /app
 
-# Enable bytecode compilation
-ENV UV_COMPILE_BYTECODE=1
+COPY pyproject.toml uv.lock README.md server.py ./
 
-# Copy from the cache instead of linking since it's a mounted volume
-ENV UV_LINK_MODE=copy
-
-# Copy project files
-COPY pyproject.toml .
-
-# Install the project's dependencies using uv
+# Build the virtual environment from the lock file so the image does not resolve
+# dependencies (or compile them from source) on the Pi itself.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -e .
-
-# Copy the rest of the application code
-COPY . .
+    uv sync --locked --no-dev
 
 # Second stage: runtime image
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Copy the virtual environment from the uv stage
-COPY --from=uv /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=uv /usr/local/bin /usr/local/bin
+RUN useradd --create-home --shell /usr/sbin/nologin mcp
 
-# Copy application code
-COPY . .
+COPY --from=builder --chown=mcp:mcp /app /app
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PATH="/app/.venv/bin:$PATH" \
+    YFINANCE_MCP_TRANSPORT=streamable-http \
+    YFINANCE_MCP_HOST=0.0.0.0 \
+    YFINANCE_MCP_PORT=8000 \
+    YFINANCE_CACHE_DIR=/home/mcp/.cache/yahoo-finance-mcp
 
-# Command to run the MCP server
-CMD ["uv", "run", "server.py"]
+USER mcp
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import os,socket; socket.create_connection(('127.0.0.1', int(os.environ['YFINANCE_MCP_PORT'])), 5).close()"]
+
+# Serves over HTTP by default (see the env vars above). For a stdio client, run:
+#   docker run -i --rm yahoo-finance-mcp yahoo-finance-mcp --transport stdio
+CMD ["yahoo-finance-mcp"]

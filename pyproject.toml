@@ -9,8 +9,11 @@ description = "MCP server implementation for yahoo finance integration"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.6.0",
+    # <2 because mcp 2.x drops the mcp.server.fastmcp API this server is built on.
+    # >=1.9.4 for the streamable-http transport used when serving over the network.
+    "mcp[cli]>=1.9.4,<2",
     "yfinance>=0.2.62",
+    "pandas>=2.0",
 ]
 
 #: setup script entry point (server.py)

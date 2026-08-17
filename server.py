@@ -1,9 +1,47 @@
+import argparse
 import json
+import logging
+import os
+import sys
 from enum import Enum
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger("yahoo_finance_mcp")
+
+TRANSPORTS = ("stdio", "sse", "streamable-http")
+
+
+def _default_cache_dir() -> Path:
+    """Directory yfinance may use for its timezone cache.
+
+    Defaults to the XDG cache directory so the server also works when it runs as a
+    system service whose home directory is read-only.
+    """
+    env_dir = os.getenv("YFINANCE_CACHE_DIR")
+    if env_dir:
+        return Path(env_dir)
+    xdg_cache = os.getenv("XDG_CACHE_HOME")
+    base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+    return base / "yahoo-finance-mcp"
+
+
+def configure_cache(cache_dir: str | None = None) -> None:
+    """Point yfinance at a writable cache directory, if there is one."""
+    path = None
+    try:
+        path = Path(cache_dir) if cache_dir else _default_cache_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        yf.set_tz_cache_location(str(path))
+        logger.debug("Using yfinance cache directory %s", path)
+    except (OSError, RuntimeError) as e:
+        # Not fatal: yfinance falls back to re-fetching timezone data every time.
+        # RuntimeError covers Path.home() failing when HOME is unset, which happens
+        # under some service managers.
+        logger.warning("Could not use cache directory %s: %s", path or "(unresolved)", e)
 
 
 # Define an enum for the type of financial statement
@@ -88,10 +126,10 @@ async def get_historical_stock_prices(
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting historical stock prices for {ticker}: {e}")
+        logger.error(f"Error: getting historical stock prices for {ticker}: {e}")
         return f"Error: getting historical stock prices for {ticker}: {e}"
 
     # If the company is found, get the historical data
@@ -116,10 +154,10 @@ async def get_stock_info(ticker: str) -> str:
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting stock information for {ticker}: {e}")
+        logger.error(f"Error: getting stock information for {ticker}: {e}")
         return f"Error: getting stock information for {ticker}: {e}"
     info = company.info
     return json.dumps(info)
@@ -144,17 +182,17 @@ async def get_yahoo_finance_news(ticker: str) -> str:
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting news for {ticker}: {e}")
+        logger.error(f"Error: getting news for {ticker}: {e}")
         return f"Error: getting news for {ticker}: {e}"
 
     # If the company is found, get the news
     try:
         news = company.news
     except Exception as e:
-        print(f"Error: getting news for {ticker}: {e}")
+        logger.error(f"Error: getting news for {ticker}: {e}")
         return f"Error: getting news for {ticker}: {e}"
 
     news_list = []
@@ -168,7 +206,7 @@ async def get_yahoo_finance_news(ticker: str) -> str:
                 f"Title: {title}\nSummary: {summary}\nDescription: {description}\nURL: {url}"
             )
     if not news_list:
-        print(f"No news found for company that searched with {ticker} ticker.")
+        logger.warning(f"No news found for company that searched with {ticker} ticker.")
         return f"No news found for company that searched with {ticker} ticker."
     return "\n\n".join(news_list)
 
@@ -187,7 +225,7 @@ async def get_stock_actions(ticker: str) -> str:
     try:
         company = yf.Ticker(ticker)
     except Exception as e:
-        print(f"Error: getting stock actions for {ticker}: {e}")
+        logger.error(f"Error: getting stock actions for {ticker}: {e}")
         return f"Error: getting stock actions for {ticker}: {e}"
     actions_df = company.actions
     actions_df = actions_df.reset_index(names="Date")
@@ -211,10 +249,10 @@ async def get_financial_statement(ticker: str, financial_type: str) -> str:
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting financial statement for {ticker}: {e}")
+        logger.error(f"Error: getting financial statement for {ticker}: {e}")
         return f"Error: getting financial statement for {ticker}: {e}"
 
     if financial_type == FinancialType.income_stmt:
@@ -272,10 +310,10 @@ async def get_holder_info(ticker: str, holder_type: str) -> str:
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting holder info for {ticker}: {e}")
+        logger.error(f"Error: getting holder info for {ticker}: {e}")
         return f"Error: getting holder info for {ticker}: {e}"
 
     if holder_type == HolderType.major_holders:
@@ -309,10 +347,10 @@ async def get_option_expiration_dates(ticker: str) -> str:
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting option expiration dates for {ticker}: {e}")
+        logger.error(f"Error: getting option expiration dates for {ticker}: {e}")
         return f"Error: getting option expiration dates for {ticker}: {e}"
     return json.dumps(company.options)
 
@@ -345,10 +383,10 @@ async def get_option_chain(ticker: str, expiration_date: str, option_type: str) 
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting option chain for {ticker}: {e}")
+        logger.error(f"Error: getting option chain for {ticker}: {e}")
         return f"Error: getting option chain for {ticker}: {e}"
 
     # Check if the expiration date is valid
@@ -387,10 +425,10 @@ async def get_recommendations(ticker: str, recommendation_type: str, months_back
     company = yf.Ticker(ticker)
     try:
         if company.isin is None:
-            print(f"Company ticker {ticker} not found.")
+            logger.warning(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
-        print(f"Error: getting recommendations for {ticker}: {e}")
+        logger.error(f"Error: getting recommendations for {ticker}: {e}")
         return f"Error: getting recommendations for {ticker}: {e}"
     try:
         if recommendation_type == RecommendationType.recommendations:
@@ -407,14 +445,89 @@ async def get_recommendations(ticker: str, recommendation_type: str, months_back
             latest_by_firm = upgrades_downgrades.drop_duplicates(subset=["Firm"])
             return latest_by_firm.to_json(orient="records", date_format="iso")
     except Exception as e:
-        print(f"Error: getting recommendations for {ticker}: {e}")
+        logger.error(f"Error: getting recommendations for {ticker}: {e}")
         return f"Error: getting recommendations for {ticker}: {e}"
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="yahoo-finance-mcp",
+        description="MCP server exposing Yahoo Finance data.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=TRANSPORTS,
+        default=os.getenv("YFINANCE_MCP_TRANSPORT", "stdio"),
+        help=(
+            "Transport to serve on. Use stdio when the MCP client launches the server "
+            "itself, or streamable-http/sse to run it as a network service "
+            "(env: YFINANCE_MCP_TRANSPORT). Default: stdio"
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("YFINANCE_MCP_HOST", "127.0.0.1"),
+        help=(
+            "Interface to bind for the http transports. Use 0.0.0.0 to accept "
+            "connections from other machines on the network "
+            "(env: YFINANCE_MCP_HOST). Default: 127.0.0.1"
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("YFINANCE_MCP_PORT", "8000")),
+        help="Port for the http transports (env: YFINANCE_MCP_PORT). Default: 8000",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help=(
+            "Directory for the yfinance timezone cache "
+            "(env: YFINANCE_CACHE_DIR). Default: ~/.cache/yahoo-finance-mcp"
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("YFINANCE_MCP_LOG_LEVEL", "INFO"),
+        help="Logging level, e.g. DEBUG, INFO, WARNING (env: YFINANCE_MCP_LOG_LEVEL). Default: INFO",
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
-    # Initialize and run the server
-    print("Starting Yahoo Finance MCP server...")
-    yfinance_server.run(transport="stdio")
+    args = parse_args()
+
+    # Log to stderr: on the stdio transport, stdout carries the JSON-RPC stream and
+    # anything else written there corrupts it.
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    configure_cache(args.cache_dir)
+
+    yfinance_server.settings.host = args.host
+    yfinance_server.settings.port = args.port
+
+    if args.transport == "stdio":
+        logger.info("Starting Yahoo Finance MCP server on stdio...")
+    else:
+        path = (
+            yfinance_server.settings.sse_path
+            if args.transport == "sse"
+            else yfinance_server.settings.streamable_http_path
+        )
+        logger.info(
+            "Starting Yahoo Finance MCP server at http://%s:%s%s (%s)...",
+            args.host,
+            args.port,
+            path,
+            args.transport,
+        )
+
+    yfinance_server.run(transport=args.transport)
 
 
 if __name__ == "__main__":
