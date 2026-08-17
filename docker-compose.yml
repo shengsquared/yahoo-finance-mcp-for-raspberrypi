@@ -1,0 +1,21 @@
+services:
+  yahoo-finance-mcp:
+    build: .
+    image: yahoo-finance-mcp:local
+    container_name: yahoo-finance-mcp
+    restart: unless-stopped
+    environment:
+      YFINANCE_MCP_TRANSPORT: streamable-http
+      YFINANCE_MCP_HOST: 0.0.0.0
+      YFINANCE_MCP_PORT: "8000"
+    ports:
+      # Bound to the LAN so other machines can reach it. The server has no
+      # authentication, so keep this off the public internet -- see
+      # docs/raspberry-pi.md for the security notes.
+      - "8000:8000"
+    volumes:
+      - yfinance-cache:/home/mcp/.cache
+    mem_limit: 512m
+
+volumes:
+  yfinance-cache:

@@ -1,0 +1,45 @@
+[Unit]
+Description=Yahoo Finance MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/yahoo-finance-mcp/.venv/bin/yahoo-finance-mcp
+Restart=on-failure
+RestartSec=5
+
+# Run as a transient system user; StateDirectory gives it a writable
+# /var/lib/yahoo-finance-mcp that survives restarts.
+DynamicUser=yes
+StateDirectory=yahoo-finance-mcp
+
+Environment=HOME=/var/lib/yahoo-finance-mcp
+Environment=YFINANCE_CACHE_DIR=/var/lib/yahoo-finance-mcp/cache
+Environment=YFINANCE_MCP_TRANSPORT=streamable-http
+# 0.0.0.0 accepts connections from other machines on the LAN. Use 127.0.0.1 if
+# only the Pi itself should reach the server.
+Environment=YFINANCE_MCP_HOST=0.0.0.0
+Environment=YFINANCE_MCP_PORT=8000
+Environment=YFINANCE_MCP_LOG_LEVEL=INFO
+
+# Keep the server from crowding out everything else on a small board.
+Nice=5
+MemoryMax=512M
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -134,6 +134,37 @@ If you are working inside a local clone and want to run the source tree directly
 uv run server.py
 ```
 
+### Running as a network service
+
+By default the server talks MCP over stdio, which means the client launches it. To keep it
+running on one machine and connect to it from another, serve it over HTTP instead:
+
+```bash
+yahoo-finance-mcp --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+The endpoint is then `http://<host>:8000/mcp`. Each flag has an environment variable
+equivalent — `YFINANCE_MCP_TRANSPORT`, `YFINANCE_MCP_HOST`, `YFINANCE_MCP_PORT`,
+`YFINANCE_MCP_LOG_LEVEL`, `YFINANCE_CACHE_DIR` — and `--transport sse` is available for
+clients that still use the older SSE transport. There is no authentication, so do not put
+the HTTP transports on an untrusted network.
+
+### Raspberry Pi
+
+The server runs well on a 64-bit Raspberry Pi (Pi 3 or newer, including the Zero 2 W). To
+install it as a systemd service that starts on boot:
+
+```bash
+git clone https://github.com/shengsquared/yahoo-finance-mcp-for-raspberrypi.git
+cd yahoo-finance-mcp-for-raspberrypi
+sudo bash scripts/install-pi.sh
+```
+
+A Docker Compose setup is included too (`docker compose up -d --build`). See
+[docs/raspberry-pi.md](docs/raspberry-pi.md) for OS and Python requirements, why 64-bit
+matters, how to connect Claude Desktop or Claude Code from another machine, resource and
+security notes, and troubleshooting.
+
 ### Integration with Claude for Desktop
 
 To integrate this server with Claude for Desktop:
