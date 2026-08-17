@@ -890,6 +890,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "saw; add that here."
         ),
     )
+    parser.add_argument(
+        "--stateful-http",
+        action="store_true",
+        default=os.getenv("YFINANCE_MCP_STATEFUL_HTTP", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Keep per-session state for the streamable-http transport instead of "
+            "handling each request independently (env: YFINANCE_MCP_STATEFUL_HTTP). "
+            "Only safe when exactly one process ever serves the traffic -- on Cloud Run "
+            "or anything else that can run multiple instances, sessions created on one "
+            "instance are invisible to the others and clients get 404s. Default: off "
+            "(stateless)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if bool(args.client_id) != bool(args.client_secret):
@@ -906,10 +919,23 @@ async def _serve_http(
     client_id: str | None,
     client_secret: str | None,
     oauth_redirect_hosts: str,
+    stateful_http: bool = False,
 ) -> None:
     """Serve the sse/streamable-http transport, bypassing FastMCP.run() so
     ClientAuthMiddleware and the OAuth routes can be attached before it starts."""
     import uvicorn
+
+    # Stateless by default. In stateful mode the streamable-http transport keeps each
+    # session in a per-process dict and answers any request carrying an unknown
+    # mcp-session-id with 404 "Session not found". That breaks as soon as more than one
+    # process can serve the traffic: on Cloud Run the client initializes on one instance,
+    # the next request is routed to another (or the first was recycled), the session isn't
+    # there, and the 404 reads to an MCP client as "no MCP server at this URL" -- which it
+    # answers by reconnecting, getting a fresh session, and failing again. Stateless mode
+    # builds a self-contained transport per request, so no session state has to be shared.
+    # Safe for this server: every tool is a plain request/response call, with no
+    # subscriptions, no server-initiated notifications, and nothing to resume.
+    yfinance_server.settings.stateless_http = not stateful_http
 
     app = yfinance_server.sse_app() if transport == "sse" else yfinance_server.streamable_http_app()
     if client_id:
@@ -973,13 +999,20 @@ def main() -> None:
     )
     auth_state = "required (client credentials)" if args.client_id else "NONE (unauthenticated)"
     logger.info(
-        "Starting Yahoo Finance MCP server at http://%s:%s%s (%s), authentication: %s...",
+        "Starting Yahoo Finance MCP server at http://%s:%s%s (%s, %s), authentication: %s...",
         args.host,
         args.port,
         path,
         args.transport,
+        "stateful sessions" if args.stateful_http else "stateless",
         auth_state,
     )
+    if args.stateful_http:
+        logger.warning(
+            "--stateful-http is set: sessions are held in this process only. If anything "
+            "else can serve the same URL (e.g. Cloud Run running more than one instance), "
+            "clients will hit 404 'Session not found' when a request lands elsewhere."
+        )
     if not args.client_id:
         logger.warning(
             "No --client-id/--client-secret set: anything that can reach %s:%s can call "
@@ -997,6 +1030,7 @@ def main() -> None:
         args.client_id,
         args.client_secret,
         args.oauth_redirect_hosts,
+        args.stateful_http,
     )
 
 

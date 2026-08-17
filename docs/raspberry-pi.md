@@ -62,6 +62,7 @@ Docker image use:
 | `--client-id` | `YFINANCE_MCP_CLIENT_ID` | unset (no auth) |
 | `--client-secret` | `YFINANCE_MCP_CLIENT_SECRET` | unset (no auth) |
 | `--oauth-redirect-hosts` | `YFINANCE_MCP_OAUTH_REDIRECT_HOSTS` | `claude.ai` |
+| `--stateful-http` | `YFINANCE_MCP_STATEFUL_HTTP` | off (stateless) |
 
 Use `--host 0.0.0.0` to accept connections from the rest of the LAN. Read the security
 note in section 6 before you do. Set `--client-id`/`--client-secret` (both, or neither) to
@@ -70,6 +71,21 @@ or via a minimal built-in OAuth flow, whichever the connecting client wants (see
 (custom connector)" below for where that matters most). Prefer the env vars over the flags
 for the secret: process arguments are visible to other users on the same machine (e.g. via
 `ps`).
+
+`--stateful-http` is worth understanding before you turn it on. By default the
+streamable-http transport runs **stateless**: each request carries everything needed to
+serve it, and no session state is kept between requests. Stateful mode instead keeps each
+client session in the serving process's memory and rejects any request carrying an
+`mcp-session-id` it doesn't recognise with `404 Session not found`. That's fine on a Pi,
+where one process serves everything. It breaks badly anywhere more than one process can
+answer the same URL -- Cloud Run being the obvious case, since it scales to multiple
+instances and doesn't pin a client to one: the client initialises against instance A, its
+next request is routed to instance B, the session isn't there, and the resulting 404 reads
+to an MCP client as "no MCP server found at this URL" -- which it responds to by
+reconnecting, getting a fresh session, and failing again in a loop. Stateless is the
+default for exactly that reason, and it costs nothing here: every tool in this server is a
+plain request/response call, with no subscriptions, no server-initiated notifications, and
+nothing to resume.
 
 ## 3. Install
 
@@ -366,3 +382,4 @@ segmentation (option 1) is the more portable fix if that matters for a container
 | claude.ai says "couldn't register with sign-in service" / OAuth registration fails | claude.ai attempted OAuth without `--client-id`/`--client-secret` set on the server, so there's no sign-in service for it to find (`/authorize`/`/token` don't exist until those are configured). Set them, or leave both the OAuth and Request Header fields empty in claude.ai and it should connect unauthenticated instead -- if it still tries OAuth against an unauthenticated server, that's claude.ai's own connector behavior, not something fixable here. |
 | OAuth flow fails at the redirect step with "Invalid redirect_uri" | The host claude.ai used doesn't match `--oauth-redirect-hosts` (default `claude.ai`). Check `journalctl -u yahoo-finance-mcp` for the "OAuth /authorize rejected redirect_uri=..." line -- it names the exact host it saw -- and add that to `YFINANCE_MCP_OAUTH_REDIRECT_HOSTS`. |
 | claude.ai connects but lists no tools / errors after connecting | Check the URL ends in `/mcp` (the `streamable-http` path) and the tunnel is actually forwarding to the server's port. Test with the `curl` command above, from a machine outside your LAN. |
+| "No MCP server found" → "connection issue" → reconnect → same thing, in a loop | A request is getting `404 Session not found`, which an MCP client reads as "nothing here". Happens when `--stateful-http` is on and more than one process serves the URL (multiple Cloud Run instances, or a container recycled between requests) -- the session only exists in the process that created it. Leave `--stateful-http` off (the default) so no session state has to be shared. |
