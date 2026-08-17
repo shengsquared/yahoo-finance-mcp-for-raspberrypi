@@ -79,15 +79,20 @@ def _verify_token(token: str, secret: str) -> dict | None:
 # Paths that must stay reachable without a token -- they're how you get one, or how a
 # client discovers where to ask. Their own logic (client_id/secret, PKCE, redirect_uri
 # allow-list) is the security boundary here, not this middleware.
-OAUTH_EXEMPT_PATHS = frozenset(
-    {
-        "/authorize",
-        "/token",
-        "/register",
-        "/.well-known/oauth-authorization-server",
-        "/.well-known/oauth-protected-resource",
-    }
+OAUTH_EXEMPT_PATHS = frozenset({"/authorize", "/token", "/register"})
+
+# Prefix rather than exact match: RFC 9728 appends the protected resource's own path to
+# the metadata URL (/.well-known/oauth-protected-resource/mcp), so the exact path varies
+# with the transport. These documents are public discovery metadata by design -- they
+# carry endpoint URLs, not secrets.
+OAUTH_EXEMPT_PREFIXES = (
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
 )
+
+
+def _is_oauth_exempt(path: str) -> bool:
+    return path in OAUTH_EXEMPT_PATHS or path.startswith(OAUTH_EXEMPT_PREFIXES)
 
 
 class ClientAuthMiddleware:
@@ -108,7 +113,7 @@ class ClientAuthMiddleware:
         if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
-        if scope["path"] in OAUTH_EXEMPT_PATHS:
+        if _is_oauth_exempt(scope["path"]):
             await self._app(scope, receive, send)
             return
 
@@ -123,10 +128,24 @@ class ClientAuthMiddleware:
                 await self._app(scope, receive, send)
                 return
 
+        # RFC 9728 / the MCP authorization spec: the 401 must advertise Bearer and point
+        # at this server's protected-resource metadata. An MCP client uses exactly this
+        # header to discover that the URL *is* an OAuth-protected MCP server and where to
+        # authenticate -- without it the client has nothing to go on and reports the URL
+        # as "no MCP server found". Basic Auth still works for anything that wants it
+        # (curl, scripts); it just isn't what gets advertised here.
+        headers = Headers(scope=scope)
+        host = headers.get("host", "")
+        base = f"{scope.get('scheme', 'https')}://{host}"
         response = Response(
             "Unauthorized",
             status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="yahoo-finance-mcp"'},
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer realm="yahoo-finance-mcp", '
+                    f'resource_metadata="{base}/.well-known/oauth-protected-resource"'
+                )
+            },
         )
         await response(scope, receive, send)
 
@@ -164,9 +183,18 @@ def _pkce_challenge_from_verifier(code_verifier: str) -> str:
 
 
 def build_oauth_routes(
-    client_id: str, client_secret: str, redirect_hosts: list[str]
+    client_id: str,
+    client_secret: str,
+    redirect_hosts: list[str],
+    resource_path: str = "/mcp",
 ) -> list[Route]:
-    """Routes implementing the minimal OAuth flow described above."""
+    """Routes implementing the minimal OAuth flow described above.
+
+    resource_path is the transport's own path (/mcp or /sse) -- it's what the
+    protected-resource metadata advertises as the protected resource, and it's used to
+    build the path-aware metadata route RFC 9728 defines for a resource that isn't at
+    the origin root.
+    """
 
     allowed_hosts = {h.strip() for h in redirect_hosts if h.strip()}
 
@@ -189,7 +217,13 @@ def build_oauth_routes(
 
     async def protected_resource_metadata(request: Request) -> Response:
         base = str(request.base_url).rstrip("/")
-        return JSONResponse({"resource": f"{base}/mcp", "authorization_servers": [base]})
+        return JSONResponse(
+            {
+                "resource": f"{base}{resource_path}",
+                "authorization_servers": [base],
+                "bearer_methods_supported": ["header"],
+            }
+        )
 
     async def authorize(request: Request) -> Response:
         if request.method == "GET":
@@ -336,6 +370,15 @@ def build_oauth_routes(
         ),
         Route(
             "/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]
+        ),
+        # RFC 9728 inserts the resource's own path into the well-known URL when the
+        # resource isn't at the origin root, so a client looking for the metadata for
+        # https://host/mcp may request /.well-known/oauth-protected-resource/mcp. Serve
+        # both spellings rather than betting on which one a given client uses.
+        Route(
+            f"/.well-known/oauth-protected-resource{resource_path}",
+            protected_resource_metadata,
+            methods=["GET"],
         ),
         Route("/authorize", authorize, methods=["GET", "POST"]),
         Route("/token", token, methods=["POST"]),
@@ -872,7 +915,16 @@ async def _serve_http(
     if client_id:
         app.add_middleware(ClientAuthMiddleware, client_id=client_id, client_secret=client_secret)
         app.routes.extend(
-            build_oauth_routes(client_id, client_secret, oauth_redirect_hosts.split(","))
+            build_oauth_routes(
+                client_id,
+                client_secret,
+                oauth_redirect_hosts.split(","),
+                resource_path=(
+                    yfinance_server.settings.sse_path
+                    if transport == "sse"
+                    else yfinance_server.settings.streamable_http_path
+                ),
+            )
         )
     config = uvicorn.Config(
         app,
